@@ -26,12 +26,13 @@ WGP table editor:
 ### UI Workflow
 
 1. Open the UI with `sudo ./bc250-cu-live-manager.sh`.
-2. Press `e` to edit the WGP routing table.
-3. Use arrow keys or `h/j/k/l` to move.
-4. Press `Space` to toggle an unlocked WGP.
-5. Press `Enter` or `a` to apply.
-6. Back in the menu, press `w` to save the current table.
-7. Press `i` to install and enable the boot service.
+2. If UMR is missing, the UI asks once whether you want to install it now.
+3. Press `e` to edit the WGP routing table.
+4. Use arrow keys or `h/j/k/l` to move.
+5. Press `Space` to toggle an unlocked WGP.
+6. Press `Enter` or `a` to apply.
+7. Back in the menu, press `w` to save the current table.
+8. Press `i` to install and enable the boot service.
 
 ### Editor Controls
 
@@ -39,6 +40,19 @@ WGP table editor:
 - Toggle: `Space`
 - Apply: `Enter` or `a`
 - Cancel: `q`
+
+### Menu Actions
+
+- `e`: edit WGP table
+- `f`: full dispatch preset
+- `t`: restore driver dispatch
+- `w`: write current table to boot config
+- `i`: install boot service
+- `u`: uninstall boot service
+- `q`: quit
+
+When UMR is not detected, the dashboard warns and the UI asks once if you want
+to install it immediately.
 
 ### `Write table` Button Behavior
 

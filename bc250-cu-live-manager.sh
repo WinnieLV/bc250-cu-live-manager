@@ -30,6 +30,7 @@ FORCE=0
 SERVICE_TABLE_PENDING=0
 DISCLAIMER_ACCEPTED=0
 DISCLAIMER_NONINTERACTIVE_SHOWN=0
+UMR_INSTALL_OFFERED=0
 
 if [ -t 1 ]; then
 	BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
@@ -831,6 +832,31 @@ print_menu() {
 	printf '\n'
 }
 
+offer_umr_install_from_menu() {
+	local ans
+	find_umr && return 0
+	[ "$UMR_INSTALL_OFFERED" -eq 1 ] && return 0
+	UMR_INSTALL_OFFERED=1
+	printf '\n'
+	prompt_line "UMR is not installed. Install it now? [y/n]: "
+	read -r ans
+	case "$ans" in
+		y|Y|yes|YES)
+			clear_screen
+			if [ "$(id -u)" != "0" ]; then
+				warn "install-umr requires root. Re-run with sudo."
+			else
+				install_umr
+			fi
+			pause_screen
+			return 1
+			;;
+		*)
+			return 0
+			;;
+	esac
+}
+
 row_label() {
 	case "$1" in
 		0) printf 'SE0.SH0' ;;
@@ -1142,6 +1168,9 @@ apply_service() {
 interactive_menu() {
 	while true; do
 		print_menu
+		if ! offer_umr_install_from_menu; then
+			continue
+		fi
 		prompt_line "Select action: "
 		read -r opt
 		case "$opt" in
