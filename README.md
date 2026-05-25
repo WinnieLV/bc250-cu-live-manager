@@ -104,11 +104,17 @@ sudo ./bc250-cu-live-manager.sh write-service-table
 The key value used by the script is:
 
 - `BC250_WGP_MASKS=SE0.SH0,SE0.SH1,SE1.SH0,SE1.SH1`
+- `UMR_ASIC=<umr asic selector>`
+- `UMR_INSTANCE=<umr dri instance>`
+- `UMR=<path to umr binary>`
 
 Example:
 
 ```ini
 BC250_WGP_MASKS=0x1f,0x1f,0x1f,0x1f
+UMR_ASIC=cyan_skillfish.gfx1013
+UMR_INSTANCE=1
+UMR=/usr/bin/umr
 ```
 
 How it is used:
@@ -116,6 +122,8 @@ How it is used:
 - `apply-service` reads this file and applies the saved masks immediately.
 - `install-service` configures a systemd oneshot service that applies this
   saved table on boot.
+- The systemd unit loads this same file as `EnvironmentFile`, so `UMR`,
+  `UMR_INSTANCE`, and `UMR_ASIC` overrides persist across reboot.
 
 ## Requirements
 
@@ -232,6 +240,9 @@ sudo ./bc250-cu-live-manager.sh --dry-run enable all
 
 # Override BC-250 PCI detection guard
 sudo ./bc250-cu-live-manager.sh --force enable all
+
+# Force umr to use a specific DRI instance
+sudo ./bc250-cu-live-manager.sh --umr-instance 1 status
 ```
 
 ## Safety Behavior
@@ -254,6 +265,17 @@ Override the ASIC selector:
 
 ```bash
 sudo UMR_ASIC='<your selector>' ./bc250-cu-live-manager.sh status
+```
+
+### `Cannot open DRI name under debugfs` / `... /sys/kernel/debug/dri/0/name is not found`
+
+BC-250 can appear at DRI instance `1` instead of `0`.
+The script auto-detects the DRI instance; if your setup still fails, set it explicitly:
+
+```bash
+sudo ./bc250-cu-live-manager.sh --umr-instance 1 status
+sudo ./bc250-cu-live-manager.sh write-service-table
+sudo ./bc250-cu-live-manager.sh install-service
 ```
 
 ### `driver topology unavailable`
