@@ -7,6 +7,11 @@ available for automation.
 
 ## Interactive UI (Recommended)
 
+Download the latest script:
+
+```bash
+curl -L -o bc250-cu-live-manager.sh https://raw.githubusercontent.com/WinnieLV/bc250-cu-live-manager/refs/heads/main/bc250-cu-live-manager.sh && chmod +x bc250-cu-live-manager.sh
+```
 Launch the UI:
 
 ```bash
@@ -148,14 +153,7 @@ How it is used:
 - `dnf` (Fedora)
 - `rpm-ostree` (Bazzite and other immutable Fedora systems)
 
-### Arch / CachyOS
-
-```bash
-sudo ./bc250-cu-live-manager.sh install-umr
-sudo ./bc250-cu-live-manager.sh
-```
-
-### Fedora
+### Arch / CachyOS / Fedora
 
 ```bash
 sudo ./bc250-cu-live-manager.sh install-umr
@@ -180,26 +178,6 @@ Notes for immutable systems:
 - `rpm-ostree install` is host-level and reboot-based.
 - Service binary install falls back to `/var/usrlocal/bin` when `/usr/local/bin`
   is not writable.
-
-## Quick Start
-
-1. Install UMR:
-
-```bash
-sudo ./bc250-cu-live-manager.sh install-umr
-```
-
-2. Open the UI:
-
-```bash
-sudo ./bc250-cu-live-manager.sh
-```
-
-3. In UI:
-   - `e` to edit table
-   - `f` for full dispatch preset
-   - `w` to write boot table
-   - `i` to install boot service
 
 ## CLI Commands (Optional)
 
@@ -251,36 +229,6 @@ sudo ./bc250-cu-live-manager.sh --umr-instance 1 status
 - Type `accept` to continue, or use `--yes` for non-interactive runs.
 - Live disable paths are blocked when driver-active WGPs would be disabled.
 
-## Troubleshooting
-
-### `umr not found`
-
-```bash
-sudo ./bc250-cu-live-manager.sh install-umr
-```
-
-### `failed to read cyan_skillfish.gfx1013.mmSPI_PG_ENABLE_STATIC_WGP_MASK`
-
-Override the ASIC selector:
-
-```bash
-sudo UMR_ASIC='<your selector>' ./bc250-cu-live-manager.sh status
-```
-
-### `Cannot open DRI name under debugfs` / `... /sys/kernel/debug/dri/0/name is not found`
-
-BC-250 can appear at DRI instance `1` instead of `0`.
-The script auto-detects the DRI instance; if your setup still fails, set it explicitly:
-
-```bash
-sudo ./bc250-cu-live-manager.sh --umr-instance 1 status
-sudo ./bc250-cu-live-manager.sh write-service-table
-sudo ./bc250-cu-live-manager.sh install-service
-```
-
-### `driver topology unavailable`
-
-Disable operations are blocked for safety when topology cannot be read.
 
 ## Sources
 
