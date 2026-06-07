@@ -51,6 +51,9 @@ Running the script without a command opens the menu.
 
 If `umr` is missing, the UI warns you and asks once whether it should try to install it.
 
+Root-required actions auto re-run with `sudo` when available, with a short
+reason printed before re-launch.
+
 ---
 
 ## Dashboard and editor
@@ -90,12 +93,14 @@ Each row has five WGP positions:
 
 | Marker | Meaning | Notes |
 | --- | --- | --- |
-| `D+` | Driver topology WGP, currently routed | Factory-enabled at driver boot. These form the 24 CU layout. |
-| `S+` | SPI-routed WGP only | Enabled by the live routing table, not part of the driver boot topology. |
-| `D!` | Driver topology WGP, not routed | Unsafe or blocked state. The script warns and refuses unsafe live disables. |
+| `D+` | Driver+routed | On in the amdgpu boot CU map and also routed now. |
+| `S+` | SPI+routed | Routed now, but not in the amdgpu boot CU map. |
+| `D!` | Driver+off | On in the amdgpu boot CU map, but off in current SPI routing. |
 | `--` | Off | Not currently routed. |
 
-`D+` entries are the factory WGPs reported by the driver when it booted. They are the reference point for the factory 24 CU configuration.
+`D+` entries are the factory WGPs reported by the amdgpu boot CU map. They are the reference point for the factory 24 CU configuration.
+
+The dashboard footer shows one summary line: `CUs active & routed : X/40`.
 
 ---
 
@@ -105,16 +110,16 @@ The UI is designed so that write operations are reviewable. Pressing an action k
 
 | Key | Menu label | Clear name | What happens |
 | --- | --- | --- | --- |
-| `e` | Edit WGP table | Custom WGP editor | Opens the WGP table editor. Toggle unlocked WGPs, then press `Enter` or `a` to review and apply the target table. |
-| `f` | Full dispatch | Full 40 CU dispatch | Builds a target table where all 20 WGPs are routed. The table is written only after you accept the safety prompt and confirm the change. |
-| `t` | Driver dispatch | Restore factory WGPs | Builds a target table from the driver boot topology. This returns routing to the factory 24 CU layout after confirmation. |
+| `e` | Edit WGP table | Custom WGP editor | Opens the WGP table editor. Toggle WGPs, then press `Enter` or `a` to review and apply the target table. |
+| `f` | Enable all CUs | Full 40 CU dispatch | Builds a target table where all 20 WGPs are routed. The table is written only after you accept the safety prompt and confirm the change. |
+| `t` | Enable default CUs | Restore factory WGPs | Builds a target table from the amdgpu boot CU map. This returns routing to the factory 24 CU layout after confirmation. |
 | `w` | Write table | Save current table | Saves the current live table to `/etc/bc250-cu-live-manager.conf`. This prepares it for boot restore, but does not install the service by itself. |
 | `i` | Install service | Enable boot restore | Installs and enables the systemd service that reapplies the saved table on boot. It uses the table saved by `Write table`. |
 | `u` | Uninstall service | Remove boot restore | Disables and removes the boot service and saved config. |
 | `q` | Quit | Exit | Leaves the current live state as it is until reboot or until another action changes it. |
 
 > [!NOTE]
-> Full dispatch and Restore factory WGPs are live actions, but they are not applied just by pressing `f` or `t`. The script first shows the target table, then asks for confirmation. Only after confirmation are the registers updated.
+> Enable all CUs and Enable default CUs are live actions, but they are not applied just by pressing `f` or `t`. The script first shows the target table, then asks for confirmation. Only after confirmation are the registers updated.
 
 ---
 
@@ -124,11 +129,11 @@ The UI is designed so that write operations are reviewable. Pressing an action k
 | --- | --- |
 | Arrow keys | Move around the table |
 | `h` `j` `k` `l` | Move using Vim-style keys |
-| `Space` | Toggle the selected unlocked WGP |
+| `Space` | Toggle the selected WGP |
 | `Enter` or `a` | Review and apply the selected table |
 | `q` | Cancel and return to the menu |
 
-Driver-active WGPs cannot be disabled live. The editor keeps those entries locked to avoid unsafe live disable paths.
+Driver-topology WGPs can also be toggled live. `D!` means driver+off.
 
 ---
 
@@ -156,7 +161,7 @@ This applies the 40 CU table, saves that live table, then installs the systemd s
 Open UI -> press t -> type accept -> review target table -> confirm y
 ```
 
-This restores the WGP routing table to the driver boot topology, which is the factory 24 CU layout.
+This restores the WGP routing table to the amdgpu boot CU map, which is the factory 24 CU layout.
 
 To keep the factory layout on future boots, either uninstall the boot service with `u`, or press `w` after restoring so the factory table becomes the saved boot table.
 
@@ -319,21 +324,16 @@ sudo ./bc250-cu-live-manager.sh status
 # Enable all supported WGPs: 40 CUs after confirmation
 sudo ./bc250-cu-live-manager.sh enable all
 
-# Restore the driver boot topology: factory 24 CUs after confirmation
+# Restore the amdgpu boot CU map: factory 24 CUs after confirmation
 sudo ./bc250-cu-live-manager.sh stock-dispatch
 ```
 
-### Target a single WGP or CU pair
+### Target specific WGP pairs
 
 ```bash
 sudo ./bc250-cu-live-manager.sh enable-wgp 1.0.4
 sudo ./bc250-cu-live-manager.sh disable-wgp 1.0.4
-
-sudo ./bc250-cu-live-manager.sh enable-cu 1.0.8
-sudo ./bc250-cu-live-manager.sh disable-cu 1.0.8
 ```
-
-`enable-cu` and `disable-cu` still operate at WGP granularity. For example, CU `8` maps to WGP `4`, which controls CU `8` and CU `9` together.
 
 ### Boot restore commands
 
@@ -395,6 +395,14 @@ No kernel patch is required for this workflow.
 
 This script writes live dispatch registers directly through UMR. Kernel patch material is still useful for research and alternate workflows, but it is not required for this tool.
 
+If you use external scripts such as `cu-map.sh`, note that they can rely on
+CU topology data exposed by the amdgpu module. On BC-250, that module view can
+be misleading without the kernel patch that overrides the default CU map.
+
+This live manager does not depend on that module-reported CU map for dispatch
+changes. It reads and writes live BC-250 routing registers through UMR, so the
+routing state shown here is the active runtime state.
+
 ---
 
 ## Safety behavior
@@ -402,8 +410,7 @@ This script writes live dispatch registers directly through UMR. Kernel patch ma
 - Write actions show a safety disclaimer unless `--yes` is used.
 - Interactive dispatch actions show the current table, the target table, and the proposed WGP changes before applying.
 - Type `accept` for the safety disclaimer, then confirm the dispatch plan with `y`.
-- Live disable paths are blocked when they would disable driver-active WGPs.
-- Driver-active WGPs are treated as locked in the editor.
+- Live disable paths are allowed, including driver-topology WGPs.
 - Boot persistence only happens after a table is saved and the service is installed.
 
 ---

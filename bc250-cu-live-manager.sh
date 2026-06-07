@@ -75,8 +75,6 @@ Usage:
   sudo ./$SCRIPT_NAME table
   sudo ./$SCRIPT_NAME enable-wgp SE.SH.WGP [...]
   sudo ./$SCRIPT_NAME disable-wgp SE.SH.WGP [...]
-  sudo ./$SCRIPT_NAME enable-cu SE.SH.CU [...]
-  sudo ./$SCRIPT_NAME disable-cu SE.SH.CU [...]
   sudo ./$SCRIPT_NAME install-service
   sudo ./$SCRIPT_NAME write-service-table
   sudo ./$SCRIPT_NAME apply-service
@@ -90,8 +88,6 @@ Commands:
   disable all             Disable all dispatch WGPs on all shader arrays.
   enable-wgp LIST         Enable specific WGP pairs, e.g. 1.0.4.
   disable-wgp LIST        Disable specific WGP pairs, e.g. 1.0.4.
-  enable-cu LIST          Enable CU pairs by CU id; 1.0.8 enables WGP4.
-  disable-cu LIST         Disable CU pairs by CU id; 1.0.8 disables WGP4.
   stock-dispatch          Restore SPI/RLC dispatch to the boot driver topology.
   install-service         Install/update the boot service.
   write-service-table     Save the current WGP table as the boot profile.
@@ -115,8 +111,10 @@ Notes:
     matching the known-working CachyOS unlock sequence.
   - write-service-table snapshots the current WGP table. Re-run it after
     table changes if status says the boot service is out of date.
-  - Live disable operations refuse to turn off WGPs that are active in the
-    driver topology; reboot with a driver mask instead if those CUs must change.
+	- Live routing operations can enable or disable any WGP pair, including
+		pairs active in the driver topology.
+	- Root-required commands auto re-run with sudo when available, with a
+		short reason printed before re-launch.
   - Write actions require a safety acknowledgment unless --yes is used.
 EOF
 }
@@ -222,6 +220,45 @@ need_root() {
 
 need_umr_root() {
 	[ "$(id -u)" = "0" ] || die "umr register access requires root. Run: sudo ./$SCRIPT_NAME ${1:-status}"
+}
+
+needs_root_command() {
+	local cmd="$1"
+	root_reason_for_command "$cmd" >/dev/null
+}
+
+root_reason_for_command() {
+	local cmd="$1"
+	case "$cmd" in
+		""|menu|status|table|apply-service|stock-dispatch|enable|disable|enable-wgp|disable-wgp)
+			printf '%s' "it needs live UMR register access"
+			return 0
+			;;
+		install-service|write-service-table|uninstall-service)
+			printf '%s' "it needs root to write systemd/service files under /etc"
+			return 0
+			;;
+		install-umr)
+			printf '%s' "it needs root to install host packages"
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+reexec_with_sudo_if_needed() {
+	local cmd="$1"
+	shift
+	local reason script_path
+	[ "$(id -u)" = "0" ] && return 0
+	reason="$(root_reason_for_command "$cmd" || true)"
+	[ -n "$reason" ] || return 0
+	command -v sudo >/dev/null 2>&1 || die "this command requires root, and sudo was not found"
+	script_path="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+	info "re-running with sudo: $reason"
+	exec sudo --preserve-env=UMR,UMR_ASIC,UMR_INSTANCE "$script_path" "$@"
 }
 
 print_disclaimer() {
@@ -408,7 +445,7 @@ confirm_dispatch_plan() {
 	while true; do
 		printf '\n'
 		panel_title "$title"
-		printf '  Legend: D+ driver+routed, S+ SPI only, -- off, D! unsafe blocked\n\n'
+		printf '  Legend: D+=driver+routed, S+=SPI+routed, D!=driver+off, --=off\n\n'
 		printf '  +---------+----------------+----------------+-----------------------+\n'
 		printf '  | Row     | Current        | Target         | Change                |\n'
 		printf '  +---------+----------------+----------------+-----------------------+\n'
@@ -825,12 +862,12 @@ register_status() {
 	fi
 	printf '  Source     : SPI dispatch masks'
 	if [ "$driver_ok" -eq 1 ]; then
-		printf ' + driver CU topology\n'
-		printf '  Legend     : %sD+%s driver+routed locked, %sS+%s SPI only, %s--%s off\n\n' \
-			"$GREEN$BOLD" "$RESET" "$CYAN" "$RESET" "$DIM" "$RESET"
+		printf ' + amdgpu boot CU map\n'
+		printf '  Legend     : %sD+%s driver+routed, %sS+%s SPI+routed, %sD!%s driver+off, %s--%s off\n\n' \
+			"$GREEN$BOLD" "$RESET" "$CYAN" "$RESET" "$RED$BOLD" "$RESET" "$DIM" "$RESET"
 	else
 		printf '\n'
-		printf '  Legend     : %sS+%s routed, %s--%s off. Driver lock state unavailable.\n\n' \
+		printf '  Legend     : %sS+%s routed, %s--%s off. Driver topology data unavailable.\n\n' \
 			"$CYAN" "$RESET" "$DIM" "$RESET"
 	fi
 	live_table_header
@@ -864,18 +901,7 @@ register_status() {
 		done
 	done
 	live_table_rule
-	printf '\n  SPI total  : %s%s/40 CUs%s\n' "$BOLD" "$total" "$RESET"
-	if [ "$service_has_config" -eq 1 ]; then
-		printf '  Boot table : %s\n' "$(mask_summary service_masks)"
-	fi
-	if [ "$driver_ok" -eq 1 ]; then
-		printf '  Driver lock: %s%s/40 CUs%s active; active WGPs cannot be disabled live\n' "$BOLD" "$driver_total" "$RESET"
-		if [ "$blocked_total" -gt 0 ]; then
-			warn "driver-active CUs are not routed by SPI (${blocked_total} CUs shown as D!)"
-		fi
-	else
-		warn "driver topology lock state unavailable; disabling dispatch will be refused"
-	fi
+		printf '\n  CUs active & routed  : %s%s/40%s\n' "$BOLD" "$total" "$RESET"
 }
 
 status() {
@@ -910,7 +936,7 @@ print_menu() {
 	hr
 	printf '%s|%s %s%-76s%s %s|%s\n' "$DIM" "$RESET" "$BOLD" "Actions" "$RESET" "$DIM" "$RESET"
 	hr
-	printf '%s|%s  %-22s  %-22s  %-27s %s|%s\n' "$DIM" "$RESET" "[e] Edit WGP table" "[f] Full dispatch" "[t] Driver dispatch" "$DIM" "$RESET"
+	printf '%s|%s  %-22s  %-22s  %-27s %s|%s\n' "$DIM" "$RESET" "[e] Edit WGP table" "[f] Enable all CUs" "[t] Enable default CUs" "$DIM" "$RESET"
 	printf '%s|%s  %-22s  ' "$DIM" "$RESET" "[i] Install service"
 	if [ "$SERVICE_TABLE_PENDING" -eq 1 ]; then
 		printf '%s%-22s%s  ' "$YELLOW$BOLD" "[w] Write table *" "$RESET"
@@ -985,10 +1011,10 @@ draw_wgp_table() {
 	local cursor_row="$1" cursor_wgp="$2" idx wgp bit cell style endstyle driver_on blocked_total=0
 	clear_screen
 	panel_title "BC-250 WGP Routing"
-	printf '  %sArrows/hjkl%s move    %sSpace%s toggle unlocked    %sEnter/a%s apply    %sq%s cancel\n' \
+	printf '  %sArrows/hjkl%s move    %sSpace%s toggle selected    %sEnter/a%s apply    %sq%s cancel\n' \
 		"$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
-	printf '  Legend: %sD+%s locked+routed, %sS+%s routed, %s--%s off\n\n' \
-		"$GREEN$BOLD" "$RESET" "$CYAN" "$RESET" "$DIM" "$RESET"
+	printf '  Legend: %sD+%s driver+routed, %sS+%s SPI+routed, %sD!%s driver+off, %s--%s off\n\n' \
+		"$GREEN$BOLD" "$RESET" "$CYAN" "$RESET" "$RED$BOLD" "$RESET" "$DIM" "$RESET"
 	printf '  +---------+------+------+------+------+------+\n'
 	printf '  | Row     | WGP0 | WGP1 | WGP2 | WGP3 | WGP4 |\n'
 	printf '  |         | 0-1  | 2-3  | 4-5  | 6-7  | 8-9  |\n'
@@ -1029,40 +1055,12 @@ draw_wgp_table() {
 	done
 	printf '  +---------+------+------+------+------+------+\n\n'
 	if [ "${driver_lock_ok:-0}" -ne 1 ]; then
-		warn "driver topology is unavailable; apply is disabled to avoid unsafe live disables"
-	elif [ "$blocked_total" -gt 0 ]; then
-		warn "driver-active CUs are not routed by SPI (${blocked_total} CUs shown as D!)"
+		printf '  Note: boot map unavailable.\n'
 	fi
-}
-
-ensure_target_mask_preserves_driver() {
-	local target_mask="$1" idx disabled
-	local -a driver_masks
-	read_driver_wgp_masks || die "driver topology unavailable; refusing to disable live dispatch"
-	for idx in 0 1 2 3; do
-		disabled=$((driver_masks[idx] & ~target_mask & 31))
-		if [ "$disabled" -ne 0 ]; then
-			die "refusing preset because it would disable driver-active WGPs on $(row_label "$idx") (mask $(hex_mask "$disabled"))"
-		fi
-	done
-}
-
-ensure_driver_active_wgps_remain_enabled() {
-	local idx new_mask locked disabled
-	[ "${driver_lock_ok:-0}" -eq 1 ] || die "driver topology unavailable; refusing to disable live dispatch"
-	for idx in 0 1 2 3; do
-		new_mask=$((masks[idx] & 31))
-		locked=$((driver_masks[idx] & 31))
-		disabled=$((locked & ~new_mask & 31))
-		if [ "$disabled" -ne 0 ]; then
-			die "refusing to disable driver-active WGPs on $(row_label "$idx") (mask $(hex_mask "$disabled"))"
-		fi
-	done
 }
 
 apply_spi_masks() {
 	require_bc250_for_write
-	ensure_driver_active_wgps_remain_enabled
 	local -a current_masks target_masks
 	read_current_masks
 	target_masks=("${masks[@]}")
@@ -1117,15 +1115,7 @@ table_editor() {
 			j|J) row=$((row < 3 ? row + 1 : 0)) ;;
 			' ')
 				bit=$((1 << wgp))
-				if [ "$driver_lock_ok" -ne 1 ]; then
-					warn "driver topology is unavailable; toggles are locked"
-					sleep 1
-				elif [ $((driver_masks[row] & bit)) -ne 0 ] && [ $((masks[row] & bit)) -ne 0 ]; then
-					warn "$(row_label "$row") WGP$wgp is active in driver topology and cannot be disabled live"
-					sleep 1
-				else
-					masks[$row]=$((masks[row] ^ bit))
-				fi
+				masks[$row]=$((masks[row] ^ bit))
 				;;
 			''|$'\n'|$'\r'|a|A)
 				apply_spi_masks
@@ -1149,20 +1139,9 @@ parse_wgp_item() {
 	printf '%s %s %s\n' "$se" "$sh" "$wgp"
 }
 
-parse_cu_item() {
-	local item="$1" se sh cu extra wgp
-	IFS='.' read -r se sh cu extra <<<"$item"
-	[ -z "${extra:-}" ] || die "invalid CU entry '$item' (expected SE.SH.CU)"
-	[[ "$se" =~ ^[0-1]$ ]] || die "invalid SE in '$item' (expected 0 or 1)"
-	[[ "$sh" =~ ^[0-1]$ ]] || die "invalid SH in '$item' (expected 0 or 1)"
-	[[ "$cu" =~ ^[0-9]$ ]] || die "invalid CU in '$item' (expected 0..9)"
-	wgp=$((cu / 2))
-	printf '%s %s %s\n' "$se" "$sh" "$wgp"
-}
-
 modify_wgps() {
-	local op="$1" mode="$2"
-	shift 2
+	local op="$1"
+	shift
 	need_root
 	need_umr
 	select_asic
@@ -1170,19 +1149,12 @@ modify_wgps() {
 	local -a current_masks target_masks driver_masks
 	read_current_masks
 	target_masks=("${current_masks[@]}")
-	read_driver_wgp_masks || [ "$op" = "enable" ] || die "driver topology unavailable; refusing to disable live dispatch"
+	read_driver_wgp_masks || true
 	local item se sh wgp parsed idx=0
 	local -a target_se target_sh target_wgp
 	for item in "$@"; do
-		if [ "$mode" = "cu" ]; then
-			parsed="$(parse_cu_item "$item")"
-		else
-			parsed="$(parse_wgp_item "$item")"
-		fi
+		parsed="$(parse_wgp_item "$item")"
 		read -r se sh wgp <<<"$parsed"
-		if [ "$op" = "disable" ] && [ $((driver_masks[se * 2 + sh] & (1 << wgp))) -ne 0 ]; then
-			die "refusing to disable SE$se SH$sh WGP$wgp; it is active in driver topology"
-		fi
 		if [ "$op" = "enable" ]; then
 			target_masks[$((se * 2 + sh))]=$((target_masks[se * 2 + sh] | (1 << wgp)))
 		else
@@ -1221,10 +1193,9 @@ disable_all() {
 	need_umr
 	select_asic
 	require_bc250_for_write
-	ensure_target_mask_preserves_driver 0
 	local -a current_masks target_masks driver_masks
 	read_current_masks
-	read_driver_wgp_masks || die "driver topology unavailable; refusing to disable live dispatch"
+	read_driver_wgp_masks || true
 	target_masks=(0 0 0 0)
 	confirm_dispatch_plan "Disable Dispatch" || return 0
 	apply_target_masks
@@ -1278,6 +1249,7 @@ interactive_menu() {
 }
 
 main() {
+	local -a original_args=("$@")
 	local args=()
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
@@ -1304,6 +1276,7 @@ main() {
 	set -- "${args[@]}"
 
 	local cmd="${1:-menu}"
+	reexec_with_sudo_if_needed "$cmd" "${original_args[@]}"
 	shift || true
 	case "$cmd" in
 		status) status ;;
@@ -1318,20 +1291,18 @@ main() {
 			case "${1:-}" in
 				all) enable_all ;;
 				"") die "enable requires 'all' or WGP entries; see --help" ;;
-				*) modify_wgps enable wgp "$@" ;;
+				*) modify_wgps enable "$@" ;;
 			esac
 			;;
 		disable)
 			case "${1:-}" in
 				all) disable_all ;;
 				"") die "disable requires 'all' or WGP entries; see --help" ;;
-				*) modify_wgps disable wgp "$@" ;;
+				*) modify_wgps disable "$@" ;;
 			esac
 			;;
-		enable-wgp) [ "$#" -gt 0 ] || die "enable-wgp requires SE.SH.WGP entries"; modify_wgps enable wgp "$@" ;;
-		disable-wgp) [ "$#" -gt 0 ] || die "disable-wgp requires SE.SH.WGP entries"; modify_wgps disable wgp "$@" ;;
-		enable-cu) [ "$#" -gt 0 ] || die "enable-cu requires SE.SH.CU entries"; modify_wgps enable cu "$@" ;;
-		disable-cu) [ "$#" -gt 0 ] || die "disable-cu requires SE.SH.CU entries"; modify_wgps disable cu "$@" ;;
+		enable-wgp) [ "$#" -gt 0 ] || die "enable-wgp requires SE.SH.WGP entries"; modify_wgps enable "$@" ;;
+		disable-wgp) [ "$#" -gt 0 ] || die "disable-wgp requires SE.SH.WGP entries"; modify_wgps disable "$@" ;;
 		stock-dispatch) stock_dispatch ;;
 		*) usage; die "unknown command: $cmd" ;;
 	esac
