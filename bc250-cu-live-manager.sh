@@ -137,7 +137,7 @@ find_umr() {
 
 need_umr() {
 	find_umr || die "umr not found. Run: sudo ./$SCRIPT_NAME install-umr"
-	select_umr_instance
+	select_umr_instance "${1:-default}"
 }
 
 validate_umr_instance() {
@@ -191,18 +191,26 @@ detect_umr_instance() {
 }
 
 select_umr_instance() {
-	local detected
+	local mode="${1:-default}" detected configured_instance="" configured_source=""
 	if [ -n "$UMR_INSTANCE" ]; then
 		validate_umr_instance "$UMR_INSTANCE" || die "invalid --umr-instance '$UMR_INSTANCE' (expected non-negative integer)"
 		UMR_INSTANCE_SOURCE="${UMR_INSTANCE_SOURCE:-env}"
-		init_umr_instance_args
-		return 0
+		configured_instance="$UMR_INSTANCE"
+		configured_source="$UMR_INSTANCE_SOURCE"
+		if [ "$mode" != "apply-service" ] || [ "$UMR_INSTANCE_SOURCE" = "cli" ]; then
+			init_umr_instance_args
+			return 0
+		fi
 	fi
 	detected="$(detect_umr_instance || true)"
 	if [ -n "$detected" ]; then
 		UMR_INSTANCE="$detected"
 		UMR_INSTANCE_SOURCE="auto"
+	elif [ -n "$configured_instance" ]; then
+		UMR_INSTANCE="$configured_instance"
+		UMR_INSTANCE_SOURCE="$configured_source"
 	else
+		UMR_INSTANCE=""
 		UMR_INSTANCE_SOURCE="default"
 	fi
 	init_umr_instance_args
@@ -535,7 +543,8 @@ write_service_table() {
 # Format: SE0.SH0,SE0.SH1,SE1.SH0,SE1.SH1 SPI WGP masks.
 BC250_WGP_MASKS=$(mask_csv current_masks)
 UMR_ASIC=$ASIC
-UMR_INSTANCE=$UMR_INSTANCE
+# Leave empty so apply-service auto-detects the DRI instance on each boot.
+UMR_INSTANCE=
 UMR=$UMR
 EOF
 	chmod 0644 "$SERVICE_CONF"
@@ -1236,7 +1245,7 @@ stock_dispatch() {
 
 apply_service() {
 	need_root
-	need_umr
+	need_umr apply-service
 	select_asic
 	require_bc250_for_write
 	local -a current_masks target_masks service_masks

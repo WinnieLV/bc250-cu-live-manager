@@ -270,12 +270,19 @@ The saved config lives here:
 /etc/bc250-cu-live-manager.conf
 ```
 
+It stores:
+
+- `BC250_WGP_MASKS=SE0.SH0,SE0.SH1,SE1.SH0,SE1.SH1`
+- `UMR_ASIC=<umr asic selector>`
+- `UMR_INSTANCE=<optional umr dri instance fallback>`
+- `UMR=<path to umr binary>`
+
 Example:
 
 ```ini
 BC250_WGP_MASKS=0x1f,0x1f,0x1f,0x1f
 UMR_ASIC=cyan_skillfish.gfx1013
-UMR_INSTANCE=1
+UMR_INSTANCE=
 UMR=/usr/bin/umr
 ```
 
@@ -283,10 +290,16 @@ UMR=/usr/bin/umr
 | --- | --- |
 | `BC250_WGP_MASKS` | Saved WGP masks in `SE0.SH0,SE0.SH1,SE1.SH0,SE1.SH1` order |
 | `UMR_ASIC` | UMR ASIC selector |
-| `UMR_INSTANCE` | UMR DRI instance |
+| `UMR_INSTANCE` | Optional UMR DRI instance fallback |
 | `UMR` | Path to the UMR binary |
 
-The systemd unit loads this file as an `EnvironmentFile`. On boot, the service runs the saved table through `apply-service` using `--yes`, so it can restore the table without an interactive prompt.
+- `apply-service` reads this file and applies the saved masks immediately.
+- `install-service` configures a systemd oneshot service that applies this
+  saved table on boot using `--yes` (non-interactive restore).
+- The systemd unit loads this same file as `EnvironmentFile`, so `UMR`
+  and `UMR_ASIC` overrides persist across reboot.
+- `apply-service` auto-detects the DRI instance each run. If detection fails,
+  a non-empty `UMR_INSTANCE` in this file is used as fallback.
 
 ---
 
