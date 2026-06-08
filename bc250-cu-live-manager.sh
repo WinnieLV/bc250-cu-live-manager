@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BC-250 live CU/WGP manager for CachyOS and Debian.
+# BC-250 live CU/WGP manager.
 #
 # This is a self-contained runtime manager. It uses UMR to read/write the
 # BC-250 gfx1013 registers that control CU enumeration and WGP dispatch.
