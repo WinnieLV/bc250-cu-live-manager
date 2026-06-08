@@ -237,8 +237,9 @@ The built-in installer supports these package managers:
 | Arch / CachyOS | `pacman` / `paru` |
 | Fedora | `dnf` |
 | Bazzite and immutable Fedora systems | `rpm-ostree` |
+| Debian | `apt-get` |
 
-### Arch, CachyOS, Fedora
+### Arch, CachyOS, Debian, Fedora
 
 ```bash
 sudo ./bc250-cu-live-manager.sh install-umr
