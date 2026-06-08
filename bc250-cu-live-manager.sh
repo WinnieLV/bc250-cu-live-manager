@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BC-250 live CU/WGP manager for CachyOS.
+# BC-250 live CU/WGP manager for CachyOS and Debian.
 #
 # This is a self-contained runtime manager. It uses UMR to read/write the
 # BC-250 gfx1013 registers that control CU enumeration and WGP dispatch.
@@ -97,7 +97,7 @@ Commands:
   write-service-table     Save the current WGP table as the boot profile.
   apply-service           Apply the table saved for the boot service.
   uninstall-service       Remove the boot service.
-  install-umr             Install umr via pacman/paru/rpm-ostree/dnf.
+  install-umr             Install umr via apt/pacman/paru/rpm-ostree/dnf.
   menu                    Interactive mode.
 
 Options:
@@ -444,9 +444,40 @@ require_bc250_for_write() {
 
 install_umr() {
 	need_root
+	if command -v dpkg >/dev/null 2>&1 && dpkg -s umr >/dev/null 2>&1; then
+		info "umr is already installed."
+		return 0
+	fi
 	if command -v pacman >/dev/null 2>&1 && pacman -Qi umr >/dev/null 2>&1; then
 		info "umr is already installed."
 		return 0
+	fi
+	if command -v apt-get >/dev/null 2>&1; then
+		info "Installing umr build dependencies with apt-get..."
+		apt-get update -qq || true
+		DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential cmake \
+			libncurses-dev libpciaccess-dev libdrm-dev llvm-dev libnanomsg-dev \
+			libgl-dev libegl-dev libgles-dev libopengl-dev libgbm-dev \
+			libedit-dev libz3-dev libzstd-dev libcurl4-gnutls-dev libsdl2-dev python3-sphinx
+
+		info "Cloning and building umr from source..."
+		(
+			build_tmp="$(mktemp -d)"
+			cd "$build_tmp"
+			git clone https://gitlab.freedesktop.org/tomstdenis/umr.git
+			cd umr
+			cmake -DUMR_GUI=OFF -B build-dir -S .
+			cmake --build build-dir
+			info "Packaging and installing umr..."
+			cd build-dir
+			sed -i 's/set(CPACK_DEBIAN_PACKAGE_DEPENDS ".*")/set(CPACK_DEBIAN_PACKAGE_DEPENDS "")/' CPackConfig.cmake
+			sed -i 's/set(CPACK_GENERATOR "RPM;DEB")/set(CPACK_GENERATOR "DEB")/' CPackConfig.cmake
+			cpack
+			dpkg -i umr-*-Linux.deb
+			cd /
+			rm -rf "$build_tmp"
+		) && return 0
+		die "Failed to build and install umr from source."
 	fi
 	if command -v pacman >/dev/null 2>&1; then
 		if pacman -Si umr >/dev/null 2>&1; then
@@ -476,7 +507,7 @@ install_umr() {
 		dnf install -y umr && return 0
 		die "dnf could not install umr; check repository availability for package 'umr'."
 	fi
-	die "could not install umr automatically; install it with pacman/paru/rpm-ostree/dnf first"
+	die "could not install umr automatically; install it with apt/pacman/paru/rpm-ostree/dnf first"
 }
 
 install_service() {
