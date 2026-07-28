@@ -21,9 +21,12 @@ SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
 SERVICE_BIN="/usr/local/bin/bc250-cu-live-manager"
 SERVICE_CONF="/etc/bc250-cu-live-manager.conf"
 OLD_UDEV_RULE="/etc/udev/rules.d/99-bc250-cu-live-manager.rules"
+STEAMOS_STATE_DIR="/var/lib/bc250-cu-live-manager"
+STEAMOS_SERVICE_BIN="$STEAMOS_STATE_DIR/bin/bc250-cu-live-manager"
 LAST_REG_PATH=""
 WGP_FULL_MASK=0x1f
 UMR="${UMR:-}"
+UMR_DATABASE_PATH="${UMR_DATABASE_PATH:-}"
 UMR_INSTANCE="${UMR_INSTANCE:-}"
 UMR_INSTANCE_SOURCE="${UMR_INSTANCE:+env}"
 YES=0
@@ -115,6 +118,8 @@ Notes:
 		pairs active in the driver topology.
 	- Root-required commands auto re-run with sudo when available, with a
 		short reason printed before re-launch.
+  - On SteamOS, a missing UMR database is installed persistently under
+    $STEAMOS_STATE_DIR so the boot service does not depend on the read-only OS image.
   - Write actions require a safety acknowledgment unless --yes is used.
 EOF
 }
@@ -133,8 +138,127 @@ find_umr() {
 	return 1
 }
 
+is_steamos() (
+	[ -r /etc/os-release ] || exit 1
+	# shellcheck disable=SC1091
+	. /etc/os-release
+	[ "${ID:-}" = "steamos" ] || [ "${VARIANT_ID:-}" = "steamdeck" ]
+)
+
+umr_database_default_path() {
+	printf '%s\n' "$STEAMOS_STATE_DIR/umr/database"
+}
+
+umr_database_looks_valid() {
+	local path="$1"
+	[ -n "$path" ] || return 1
+	[ -d "$path" ] || return 1
+	[ -r "$path/pci.did" ] || return 1
+	[ -r "$path/cyan_skillfish.asic" ] || return 1
+	[ -r "$path/cyan_skillfish.soc15" ] || return 1
+	find "$path/ip" -type f -print -quit 2>/dev/null | grep -q .
+}
+
+find_installed_umr_database() {
+	local resolved binary_dir candidate
+	resolved="$(readlink -f "$UMR" 2>/dev/null || printf '%s' "$UMR")"
+	binary_dir="$(dirname "$resolved")"
+	for candidate in \
+		"$binary_dir/../share/umr" \
+		"$binary_dir/../share/umr/database" \
+		"$binary_dir/../../../database" \
+		/usr/local/share/umr \
+		/usr/local/share/umr/database \
+		/usr/share/umr \
+		/usr/share/umr/database \
+		/app/share/umr \
+		/app/share/umr/database; do
+		if umr_database_looks_valid "$candidate"; then
+			printf '%s\n' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+download_umr_database() {
+	local dest="$1" tmp clone_dir archive extract_dir src="" candidate staging url
+	tmp="$(mktemp -d)"
+	clone_dir="$tmp/umr-repo"
+	archive="$tmp/umr.tar.gz"
+	extract_dir="$tmp/extract"
+
+	if command -v git >/dev/null 2>&1; then
+		if GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://gitlab.freedesktop.org/tomstdenis/umr.git "$clone_dir" >/dev/null 2>&1 && \
+			umr_database_looks_valid "$clone_dir/database"; then
+			src="$clone_dir/database"
+		fi
+	fi
+
+	if [ -z "$src" ] && command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+		for url in \
+			https://gitlab.freedesktop.org/tomstdenis/umr/-/archive/master/umr-master.tar.gz \
+			https://gitlab.freedesktop.org/tomstdenis/umr/-/archive/main/umr-main.tar.gz; do
+			rm -rf "$extract_dir"
+			mkdir -p "$extract_dir"
+			if curl -fL --connect-timeout 15 --max-time 120 "$url" -o "$archive" && \
+				tar -xzf "$archive" -C "$extract_dir"; then
+				candidate="$(find "$extract_dir" -maxdepth 4 -type d -name database -print -quit 2>/dev/null || true)"
+				if umr_database_looks_valid "$candidate"; then
+					src="$candidate"
+					break
+				fi
+			fi
+		done
+	fi
+
+	if [ -z "$src" ]; then
+		rm -rf "$tmp"
+		die "failed to download a usable UMR database; install git or curl and tar, then retry"
+	fi
+
+	install -d -m 0755 "$(dirname "$dest")"
+	staging="$(mktemp -d "${dest}.new.XXXXXX")"
+	cp -a "$src"/. "$staging"/
+	if ! umr_database_looks_valid "$staging"; then
+		rm -rf "$staging" "$tmp"
+		die "downloaded UMR database is incomplete for cyan_skillfish"
+	fi
+	rm -rf "$dest"
+	mv "$staging" "$dest"
+	chmod -R a+rX "$dest" || true
+	rm -rf "$tmp"
+}
+
+ensure_umr_database() {
+	local default_path
+	is_steamos || return 0
+	default_path="$(umr_database_default_path)"
+
+	if [ -n "$UMR_DATABASE_PATH" ]; then
+		if umr_database_looks_valid "$UMR_DATABASE_PATH"; then
+			export UMR_DATABASE_PATH
+			return 0
+		fi
+		[ "$UMR_DATABASE_PATH" = "$default_path" ] || die "UMR_DATABASE_PATH does not contain a usable cyan_skillfish UMR database: $UMR_DATABASE_PATH"
+	elif find_installed_umr_database >/dev/null; then
+		return 0
+	else
+		UMR_DATABASE_PATH="$default_path"
+		export UMR_DATABASE_PATH
+	fi
+
+	if [ "${BC250_SERVICE_RESTORE:-0}" = "1" ]; then
+		die "SteamOS UMR database is missing at $UMR_DATABASE_PATH; run sudo ./$SCRIPT_NAME status interactively to provision it before restarting $SERVICE_NAME"
+	fi
+	[ "$(id -u)" = "0" ] || die "SteamOS UMR database is missing at $UMR_DATABASE_PATH. Re-run with sudo so the script can install it."
+	info "SteamOS: installing UMR database into $UMR_DATABASE_PATH"
+	download_umr_database "$UMR_DATABASE_PATH"
+}
+
 need_umr() {
 	find_umr || die "umr not found. Run: sudo ./$SCRIPT_NAME install-umr"
+	ensure_umr_database
 	select_umr_instance "${1:-default}"
 }
 
@@ -258,7 +382,7 @@ reexec_with_sudo_if_needed() {
 	command -v sudo >/dev/null 2>&1 || die "this command requires root, and sudo was not found"
 	script_path="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 	info "re-running with sudo: $reason"
-	exec sudo --preserve-env=UMR,UMR_ASIC,UMR_INSTANCE "$script_path" "$@"
+	exec sudo --preserve-env=UMR,UMR_ASIC,UMR_DATABASE_PATH,UMR_INSTANCE "$script_path" "$@"
 }
 
 print_disclaimer() {
@@ -489,6 +613,9 @@ require_bc250_for_write() {
 
 install_umr() {
 	need_root
+	if is_steamos; then
+		warn "SteamOS package changes can require temporarily disabling its read-only root filesystem and may be removed by an OS update."
+	fi
 	if command -v dpkg >/dev/null 2>&1 && dpkg -s umr >/dev/null 2>&1; then
 		info "umr is already installed."
 		return 0
@@ -559,16 +686,22 @@ install_service() {
 	need_root
 	need_umr
 	confirm_service_install || return 0
-	local source_path
+	local source_path service_bin
 	source_path="$(readlink -f "$0")"
-	if ! install -m 0755 "$source_path" "$SERVICE_BIN"; then
+	service_bin="$SERVICE_BIN"
+	if is_steamos; then
+		service_bin="$STEAMOS_SERVICE_BIN"
+		install -d -m 0755 "$(dirname "$service_bin")"
+	fi
+	if ! install -m 0755 "$source_path" "$service_bin"; then
 		if [ -d /var/usrlocal/bin ]; then
-			SERVICE_BIN="/var/usrlocal/bin/bc250-cu-live-manager"
-			install -m 0755 "$source_path" "$SERVICE_BIN"
+			service_bin="/var/usrlocal/bin/bc250-cu-live-manager"
+			install -m 0755 "$source_path" "$service_bin"
 		else
-			die "failed to install service binary at $SERVICE_BIN"
+			die "failed to install service binary at $service_bin"
 		fi
 	fi
+	SERVICE_BIN="$service_bin"
 	cat > "$SERVICE_PATH" <<EOF
 [Unit]
 Description=BC-250 CU saved enumeration and dispatch
@@ -579,7 +712,7 @@ Wants=systemd-udev-settle.service
 Type=oneshot
 EnvironmentFile=-$SERVICE_CONF
 ExecStartPre=/usr/bin/bash -c 'for _ in {1..30}; do compgen -G "/dev/dri/renderD*" >/dev/null && exit 0; sleep 1; done; exit 1'
-ExecStart=$SERVICE_BIN --yes apply-service
+ExecStart=/usr/bin/env BC250_SERVICE_RESTORE=1 $SERVICE_BIN --yes apply-service
 RemainAfterExit=yes
 
 [Install]
@@ -590,9 +723,11 @@ EOF
 	systemctl enable "$SERVICE_NAME"
 	if [ -f "$SERVICE_CONF" ]; then
 		info "installed and enabled $SERVICE_NAME"
+		info "installed service binary at $SERVICE_BIN"
 		info "saved boot table will be applied on next boot; use apply-service to apply it now"
 	else
 		info "installed and enabled $SERVICE_NAME"
+		info "installed service binary at $SERVICE_BIN"
 		warn "no boot table is saved yet; use write-service-table before rebooting"
 	fi
 }
@@ -610,6 +745,8 @@ write_service_table() {
 # Generated by $SCRIPT_NAME on $(date -Iseconds).
 # Format: SE0.SH0,SE0.SH1,SE1.SH0,SE1.SH1 SPI WGP masks.
 BC250_WGP_MASKS=$(mask_csv current_masks)
+# Leave empty to use UMR's installed database; SteamOS saves its persistent fallback here.
+UMR_DATABASE_PATH=$UMR_DATABASE_PATH
 UMR_ASIC=$ASIC
 # Leave empty so apply-service auto-detects the DRI instance on each boot.
 UMR_INSTANCE=
@@ -622,7 +759,8 @@ EOF
 uninstall_service() {
 	need_root
 	systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-	rm -f "$SERVICE_PATH" "$SERVICE_BIN" "/var/usrlocal/bin/bc250-cu-live-manager" "$SERVICE_CONF" "$OLD_UDEV_RULE"
+	rm -f "$SERVICE_PATH" "$SERVICE_BIN" "/var/usrlocal/bin/bc250-cu-live-manager" "$STEAMOS_SERVICE_BIN" \
+		"$STEAMOS_STATE_DIR/umr/bc250-cu-live-manager" "$SERVICE_CONF" "$OLD_UDEV_RULE"
 	systemctl daemon-reload
 	info "removed $SERVICE_NAME"
 }
@@ -878,6 +1016,14 @@ register_status() {
 		printf '  UMR inst   : %s (%s)\n' "$UMR_INSTANCE" "$UMR_INSTANCE_SOURCE"
 	else
 		printf '  UMR inst   : default (0)\n'
+	fi
+	if is_steamos; then
+		printf '  Platform   : SteamOS\n'
+		if [ -n "$UMR_DATABASE_PATH" ]; then
+			printf '  UMR db     : %s\n' "$UMR_DATABASE_PATH"
+		else
+			printf '  UMR db     : UMR installed default\n'
+		fi
 	fi
 	printf '  ASIC       : %s\n' "$ASIC"
 	module_status
