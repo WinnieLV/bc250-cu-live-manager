@@ -230,6 +230,8 @@ The `*` means the current live table is not saved as the boot table.
 - `libdrm_amdgpu.so.1`
 - `systemd` for boot restore
 - Root privileges for register access
+- On SteamOS only, `git`, or both `curl` and `tar`, when a fallback UMR
+  database must be downloaded
 
 ---
 
@@ -239,10 +241,63 @@ The built-in installer supports these package managers:
 
 | System | Package tool |
 | --- | --- |
+| SteamOS | `pacman` / `paru` when the host filesystem and repositories allow it |
 | Arch / CachyOS | `pacman` / `paru` |
 | Fedora | `dnf` |
 | Bazzite and immutable Fedora systems | `rpm-ostree` |
 | Debian | `apt-get` |
+
+### SteamOS
+
+SteamOS support is detected automatically from `/etc/os-release`. Complete the
+following steps in order.
+
+1. **Install or verify UMR.** The database fallback does not install the UMR
+   executable. The built-in installer can attempt `pacman` or `paru` when a
+   suitable repository is available:
+
+   ```bash
+   sudo ./bc250-cu-live-manager.sh install-umr
+   ```
+
+   SteamOS can require temporarily making its host filesystem writable before
+   installing host packages, and a SteamOS update can remove manually installed
+   packages.
+
+2. **Initialize the UMR database.** With Internet access, run:
+
+   ```bash
+   sudo ./bc250-cu-live-manager.sh status
+   ```
+
+   The script uses an explicit valid `UMR_DATABASE_PATH` first. When no path is
+   set, it uses a compatible database installed with UMR; if neither is
+   available, it creates and reuses a persistent BC-250 (`cyan_skillfish`)
+   fallback at:
+
+   ```text
+   /var/lib/bc250-cu-live-manager/umr/database
+   ```
+
+    The fallback tries `git` first, then `curl` plus `tar`, and checks that the
+    downloaded database root contains `pci.did` before using it. These download
+    tools and Internet access are only needed when the fallback must be created.
+
+> [!IMPORTANT]
+> Complete the database initialization before relying on boot restore. The
+> service deliberately never downloads files while the system starts.
+
+#### Use a custom database (optional)
+
+Point `UMR_DATABASE_PATH` at the **root of the UMR database tree**:
+
+```bash
+sudo UMR_DATABASE_PATH=/path/to/umr/database ./bc250-cu-live-manager.sh status
+```
+
+The path must be a readable UMR database root containing `pci.did`. An invalid
+custom path is rejected rather than overwritten. `write-service-table` saves
+the selected path for boot restore.
 
 ### Arch, CachyOS, Debian, Fedora
 
@@ -279,6 +334,7 @@ The saved config lives here:
 It stores:
 
 - `BC250_WGP_MASKS=SE0.SH0,SE0.SH1,SE1.SH0,SE1.SH1`
+- `UMR_DATABASE_PATH=<optional UMR database root>`
 - `UMR_ASIC=<umr asic selector>`
 - `UMR_INSTANCE=<optional umr dri instance fallback>`
 - `UMR=<path to umr binary>`
@@ -287,6 +343,7 @@ Example:
 
 ```ini
 BC250_WGP_MASKS=0x1f,0x1f,0x1f,0x1f
+UMR_DATABASE_PATH=
 UMR_ASIC=cyan_skillfish.gfx1013
 UMR_INSTANCE=
 UMR=/usr/bin/umr
@@ -295,6 +352,7 @@ UMR=/usr/bin/umr
 | Key | Meaning |
 | --- | --- |
 | `BC250_WGP_MASKS` | Saved WGP masks in `SE0.SH0,SE0.SH1,SE1.SH0,SE1.SH1` order |
+| `UMR_DATABASE_PATH` | Optional UMR database root. Empty uses UMR's installed database; SteamOS saves its persistent fallback here. |
 | `UMR_ASIC` | UMR ASIC selector |
 | `UMR_INSTANCE` | Optional UMR DRI instance fallback |
 | `UMR` | Path to the UMR binary |
@@ -302,10 +360,40 @@ UMR=/usr/bin/umr
 - `apply-service` reads this file and applies the saved masks immediately.
 - `install-service` configures a systemd oneshot service that applies this
   saved table on boot using `--yes` (non-interactive restore).
-- The systemd unit loads this same file as `EnvironmentFile`, so `UMR`
-  and `UMR_ASIC` overrides persist across reboot.
+- The systemd unit loads this same file as `EnvironmentFile`, so `UMR`,
+  `UMR_DATABASE_PATH`, and `UMR_ASIC` overrides persist across reboot.
 - `apply-service` auto-detects the DRI instance each run. If detection fails,
   a non-empty `UMR_INSTANCE` in this file is used as fallback.
+
+### SteamOS boot restore
+
+After completing the SteamOS database initialization above, install the service
+normally. On SteamOS, the service copy is stored in the persistent location:
+
+```text
+/var/lib/bc250-cu-live-manager/bin/bc250-cu-live-manager
+```
+
+The service never downloads a database at startup. If the packaged or
+persistent fallback database is missing, run
+`sudo ./bc250-cu-live-manager.sh status` interactively to provision it, then
+restart the service. If you configured a custom `UMR_DATABASE_PATH`, correct
+that path first rather than expecting it to be replaced automatically:
+
+```bash
+sudo systemctl restart bc250-cu-live-manager.service
+```
+
+The UMR executable remains a host dependency. If a SteamOS update removes it,
+reinstall UMR and run `status` again before starting the service.
+
+`uninstall-service` removes the systemd unit, saved boot profile, and copied
+manager, but deliberately keeps the downloaded database. To remove all
+remaining persistent manager data after uninstalling the service:
+
+```bash
+sudo rm -rf /var/lib/bc250-cu-live-manager
+```
 
 ---
 
@@ -422,3 +510,5 @@ routing state shown here is the active runtime state.
   https://github.com/duggasco/bc250-40cu-unlock
 - Live unlock test and demo script:  
   https://github.com/gennro/bc250-toolkit/blob/main/CachyOS-BC250-CU-Unlock.sh
+- SteamOS support was informed by the original SteamOS fork:  
+  https://github.com/F5GO/bc250-cu-live-manager-SteamOS
