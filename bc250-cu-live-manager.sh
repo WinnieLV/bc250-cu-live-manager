@@ -154,9 +154,6 @@ umr_database_looks_valid() {
 	[ -n "$path" ] || return 1
 	[ -d "$path" ] || return 1
 	[ -r "$path/pci.did" ] || return 1
-	[ -r "$path/cyan_skillfish.asic" ] || return 1
-	[ -r "$path/cyan_skillfish.soc15" ] || return 1
-	find "$path/ip" -type f -print -quit 2>/dev/null | grep -q .
 }
 
 find_installed_umr_database() {
@@ -222,7 +219,7 @@ download_umr_database() {
 	cp -a "$src"/. "$staging"/
 	if ! umr_database_looks_valid "$staging"; then
 		rm -rf "$staging" "$tmp"
-		die "downloaded UMR database is incomplete for cyan_skillfish"
+		die "downloaded UMR database is missing pci.did"
 	fi
 	rm -rf "$dest"
 	mv "$staging" "$dest"
@@ -240,12 +237,15 @@ ensure_umr_database() {
 			export UMR_DATABASE_PATH
 			return 0
 		fi
-		[ "$UMR_DATABASE_PATH" = "$default_path" ] || die "UMR_DATABASE_PATH does not contain a usable cyan_skillfish UMR database: $UMR_DATABASE_PATH"
+		[ "$UMR_DATABASE_PATH" = "$default_path" ] || die "UMR_DATABASE_PATH does not contain a readable UMR database root: $UMR_DATABASE_PATH"
 	elif find_installed_umr_database >/dev/null; then
 		return 0
 	else
 		UMR_DATABASE_PATH="$default_path"
 		export UMR_DATABASE_PATH
+	fi
+	if umr_database_looks_valid "$UMR_DATABASE_PATH"; then
+		return 0
 	fi
 
 	if [ "${BC250_SERVICE_RESTORE:-0}" = "1" ]; then
