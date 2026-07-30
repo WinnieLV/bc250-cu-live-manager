@@ -21,6 +21,14 @@ SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
 SERVICE_BIN="/usr/local/bin/bc250-cu-live-manager"
 SERVICE_CONF="/etc/bc250-cu-live-manager.conf"
 OLD_UDEV_RULE="/etc/udev/rules.d/99-bc250-cu-live-manager.rules"
+# CPU core unlock: SMN index/data window at PCI config 0xB8/0xBC on the GNB.
+SMN_PCI_DEV="0000:00:00.0"
+CPU_MASK_REG=$((0x0115A870))
+SMU_MSG_WRITE_FF=$((0x98))
+SMU_Q3_CMD=$((0x03B10A20))
+SMU_Q3_RSP=$((0x03B10A80))
+SMU_Q3_ARG=$((0x03B10A88))
+GOVERNOR_SERVICE="cyan-skillfish-governor-smu.service"
 LAST_REG_PATH=""
 WGP_FULL_MASK=0x1f
 UMR="${UMR:-}"
@@ -75,6 +83,7 @@ Usage:
   sudo ./$SCRIPT_NAME table
   sudo ./$SCRIPT_NAME enable-wgp SE.SH.WGP [...]
   sudo ./$SCRIPT_NAME disable-wgp SE.SH.WGP [...]
+  sudo ./$SCRIPT_NAME cpu-unlock
   sudo ./$SCRIPT_NAME install-service
   sudo ./$SCRIPT_NAME write-service-table
   sudo ./$SCRIPT_NAME apply-service
@@ -89,6 +98,8 @@ Commands:
   enable-wgp LIST         Enable specific WGP pairs, e.g. 1.0.4.
   disable-wgp LIST        Disable specific WGP pairs, e.g. 1.0.4.
   stock-dispatch          Restore SPI/RLC dispatch to the boot driver topology.
+  cpu-unlock              Unlock the 2 factory-disabled CPU cores via the SMU
+                          (6c/12t -> 8c/16t), then offer a reboot to apply.
   install-service         Install/update the boot service.
   write-service-table     Save the current WGP table as the boot profile.
   apply-service           Apply the table saved for the boot service.
@@ -116,6 +127,9 @@ Notes:
 	- Root-required commands auto re-run with sudo when available, with a
 		short reason printed before re-launch.
   - Write actions require a safety acknowledgment unless --yes is used.
+  - cpu-unlock raises the SMU core presence mask 0x77 -> 0xFF; the extra
+    cores come online on the next reboot and may be unstable.
+    The unlock is volatile: re-run it after a cold power cycle.
 EOF
 }
 
@@ -236,6 +250,10 @@ root_reason_for_command() {
 			;;
 		install-service|write-service-table|uninstall-service)
 			printf '%s' "it needs root to write systemd/service files under /etc"
+			return 0
+			;;
+		cpu-unlock)
+			printf '%s' "it needs root for SMU access through PCI config space"
 			return 0
 			;;
 		install-umr)
@@ -553,6 +571,230 @@ install_umr() {
 		die "dnf could not install umr; check repository availability for package 'umr'."
 	fi
 	die "could not install umr automatically; install it with apt/pacman/paru/rpm-ostree/dnf first"
+}
+
+have_setpci() {
+	command -v setpci >/dev/null 2>&1 && [ -e "/sys/bus/pci/devices/$SMN_PCI_DEV/config" ]
+}
+
+pci_cfg_write32() {
+	setpci -s "$SMN_PCI_DEV" "$1.L=$(printf '%08x' "$2")"
+}
+
+pci_cfg_read32() {
+	local out
+	out="$(setpci -s "$SMN_PCI_DEV" "$1.L")" || return 1
+	printf '0x%s\n' "$out"
+}
+
+smn_read32() {
+	pci_cfg_write32 B8 "$1" || return 1
+	pci_cfg_read32 BC
+}
+
+smn_write32() {
+	pci_cfg_write32 B8 "$1" && pci_cfg_write32 BC "$2"
+}
+
+smu_rsp_done() {
+	case "$(( $1 ))" in
+		1|252|253|254|255) return 0 ;;
+	esac
+	return 1
+}
+
+# Send an SMU queue-3 message and print the response status.
+# Returns 1 on PCI access failure, 2 on mailbox timeout (do not retry).
+smu_q3_send() {
+	local msg="$1" arg="$2" deadline rsp
+	deadline=$((SECONDS + 6))
+	while :; do
+		rsp="$(smn_read32 "$SMU_Q3_RSP")" || return 1
+		smu_rsp_done "$rsp" && break
+		[ "$SECONDS" -lt "$deadline" ] || break
+		sleep 0.002
+	done
+	smn_write32 "$SMU_Q3_RSP" 0 || return 1
+	smn_write32 "$SMU_Q3_ARG" "$arg" || return 1
+	smn_write32 "$((SMU_Q3_ARG + 4))" 0 || return 1
+	smn_write32 "$SMU_Q3_CMD" "$msg" || return 1
+	deadline=$((SECONDS + 6))
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		rsp="$(smn_read32 "$SMU_Q3_RSP")" || return 1
+		if smu_rsp_done "$rsp"; then
+			printf '%s\n' "$rsp"
+			return 0
+		fi
+		sleep 0.002
+	done
+	return 2
+}
+
+# Threads the kernel enumerated at boot, regardless of online/offline state.
+cpu_present_threads() {
+	local present part lo hi total=0
+	local -a parts
+	present="$(cat /sys/devices/system/cpu/present 2>/dev/null)" || { printf '0\n'; return; }
+	IFS=',' read -ra parts <<<"$present"
+	for part in "${parts[@]}"; do
+		if [[ "$part" == *-* ]]; then
+			lo="${part%-*}"
+			hi="${part#*-}"
+			total=$((total + hi - lo + 1))
+		else
+			total=$((total + 1))
+		fi
+	done
+	printf '%s\n' "$total"
+}
+
+# Raise the core presence mask
+# (SMN 0x0115A870) from 0x77 to 0xFF via ungated SMU queue-3 message 0x98.
+# The mask is not host-writable; the write takes effect on the next reboot
+# and a cold power cycle reverts it.
+CPU_UNLOCK_REBOOT_NEEDED=0
+cpu_unlock_now() {
+	need_root
+	CPU_UNLOCK_REBOOT_NEEDED=0
+	local present
+	present="$(cpu_present_threads)"
+	if [ "$present" -ge 16 ]; then
+		info "CPU cores are already unlocked and active ($present threads present)"
+		return 0
+	fi
+	if ! have_setpci; then
+		err "setpci or PCI device $SMN_PCI_DEV unavailable; cannot unlock CPU cores"
+		return 1
+	fi
+	local before after st rc=0 governor_was_active=0
+	if systemctl is-active --quiet "$GOVERNOR_SERVICE" 2>/dev/null; then
+		governor_was_active=1
+		info "stopping $GOVERNOR_SERVICE for SMU mailbox access"
+		systemctl stop "$GOVERNOR_SERVICE"
+	fi
+	if before="$(smn_read32 "$CPU_MASK_REG")"; then
+		info "core presence mask: $before"
+		if [ $((before & 0xFF)) -eq $((0xFF)) ]; then
+			info "mask is already 0xFF; reboot to bring up all 8 cores (16 threads)"
+			CPU_UNLOCK_REBOOT_NEEDED=1
+		elif [ $((before & 0xFF)) -ne $((0x77)) ]; then
+			err "unexpected core mask $(printf '0x%02X' $((before & 0xFF))), expected 0x77; aborting"
+			rc=1
+		elif [ "$DRY_RUN" -eq 1 ]; then
+			printf 'dry-run: setpci SMU Q3 msg 0x%02X arg 0x%08X on %s\n' \
+				"$SMU_MSG_WRITE_FF" "$CPU_MASK_REG" "$SMN_PCI_DEV"
+		else
+			st="$(smu_q3_send "$SMU_MSG_WRITE_FF" "$CPU_MASK_REG")" || rc=$?
+			if [ "$rc" -eq 2 ]; then
+				err "SMU mailbox timeout; aborting, do not retry before a reboot"
+			elif [ "$rc" -ne 0 ]; then
+				err "PCI config access failed during SMU message"
+			elif [ $((st)) -ne 1 ]; then
+				err "SMU Q3 0x98 returned $(printf '0x%02X' $((st))); is the governor stopped?"
+				rc=1
+			else
+				sleep 0.2
+				after="$(smn_read32 "$CPU_MASK_REG")" || after=""
+				info "core mask after write: ${after:-read failed}"
+				if [ -n "$after" ] && [ $((after & 0xFF)) -eq $((0xFF)) ]; then
+					info "CPU core unlock written"
+					CPU_UNLOCK_REBOOT_NEEDED=1
+				else
+					err "core mask did not take"
+					rc=1
+				fi
+			fi
+		fi
+	else
+		err "failed to read core presence mask via setpci"
+		rc=1
+	fi
+	if [ "$governor_was_active" -eq 1 ]; then
+		systemctl start "$GOVERNOR_SERVICE" || warn "failed to restart $GOVERNOR_SERVICE"
+	fi
+	return "$rc"
+}
+
+confirm_cpu_unlock() {
+	confirm_disclaimer || return 1
+	[ "$YES" -eq 1 ] && return 0
+	local ans
+	while true; do
+		printf '\n'
+		panel_title "Confirm CPU Core Unlock"
+		printf '| %-76s |\n' "This sends SMU message 0x98 to raise the core presence mask 0x77 -> 0xFF,"
+		printf '| %-76s |\n' "enabling the 2 factory-disabled CPU cores (6c/12t -> 8c/16t) on next reboot."
+		printf '| %-76s |\n' "Those cores may have been disabled for a reason; stress-test before trusting."
+		printf '| %-76s |\n' "The unlock is volatile: re-run it after a cold power cycle."
+		hr
+		prompt_line "Unlock CPU cores now? [y/n]: "
+		read -r ans
+		case "$ans" in
+			y|Y|yes|YES) return 0 ;;
+			n|N|no|NO) warn "cancelled"; return 1 ;;
+			*) warn "type y or n" ;;
+		esac
+	done
+}
+
+offer_cpu_unlock_reboot() {
+	local ans
+	if [ "$YES" -eq 1 ]; then
+		info "reboot when ready to bring up all 8 cores (16 threads)"
+		return 0
+	fi
+	while true; do
+		printf '\n'
+		prompt_line "Reboot now to bring up all 8 cores? [y/n]: "
+		read -r ans
+		case "$ans" in
+			y|Y|yes|YES)
+				info "rebooting..."
+				systemctl reboot
+				return 0
+				;;
+			n|N|no|NO)
+				info "reboot skipped; the cores will come up on the next reboot"
+				return 0
+				;;
+			*) warn "type y or n" ;;
+		esac
+	done
+}
+
+cpu_unlock() {
+	need_root
+	require_bc250_for_write
+	confirm_cpu_unlock || return 0
+	cpu_unlock_now || return 1
+	if [ "$CPU_UNLOCK_REBOOT_NEEDED" -eq 1 ]; then
+		offer_cpu_unlock_reboot
+	fi
+}
+
+cpu_status() {
+	local present online mask lo state
+	present="$(cpu_present_threads)"
+	online="$(nproc 2>/dev/null || printf '?')"
+	if [ "$present" -ge 16 ]; then
+		state="unlocked 8c/16t"
+	elif systemctl is-active --quiet "$GOVERNOR_SERVICE" 2>/dev/null; then
+		state="mask not probed (governor active)"
+	elif ! have_setpci; then
+		state="mask unavailable (setpci missing)"
+	elif mask="$(smn_read32 "$CPU_MASK_REG" 2>/dev/null)"; then
+		lo=$((mask & 0xFF))
+		if [ "$lo" -eq $((0xFF)) ]; then
+			state="unlock armed; reboot pending"
+		elif [ "$lo" -eq $((0x77)) ]; then
+			state="stock 6c/12t"
+		else
+			state="unknown mask $(printf '0x%02X' "$lo")"
+		fi
+	else
+		state="mask read failed"
+	fi
+	printf '  CPU        : %s threads present, %s online; %s\n' "$present" "$online" "$state"
 }
 
 install_service() {
@@ -881,6 +1123,7 @@ register_status() {
 	fi
 	printf '  ASIC       : %s\n' "$ASIC"
 	module_status
+	cpu_status
 	if command -v systemctl >/dev/null 2>&1 && [ -f "$SERVICE_PATH" ]; then
 		printf '  Service    : %s\n' "$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || printf 'installed')"
 		if [ "$SERVICE_TABLE_PENDING" -eq 1 ]; then
@@ -975,7 +1218,7 @@ print_menu() {
 		printf '%-22s  ' "[w] Write table"
 	fi
 	printf '%-27s %s|%s\n' "[u] Uninstall service" "$DIM" "$RESET"
-	printf '%s|%s  %-75s %s|%s\n' "$DIM" "$RESET" "[q] Quit" "$DIM" "$RESET"
+	printf '%s|%s  %-22s  %-22s  %-27s %s|%s\n' "$DIM" "$RESET" "[c] Unlock CPU cores" "[q] Quit" "" "$DIM" "$RESET"
 	hr
 	printf '\n'
 }
@@ -1270,6 +1513,7 @@ interactive_menu() {
 			e|E) table_editor ;;
 			f|F) clear_screen; enable_all; pause_screen ;;
 			t|T) clear_screen; stock_dispatch; pause_screen ;;
+			c|C) clear_screen; cpu_unlock || true; pause_screen ;;
 			i|I) clear_screen; install_service; pause_screen ;;
 			w|W) clear_screen; write_service_table; pause_screen ;;
 			u|U) clear_screen; uninstall_service; pause_screen ;;
@@ -1312,6 +1556,7 @@ main() {
 	case "$cmd" in
 		status) status ;;
 		table) table_editor ;;
+		cpu-unlock) cpu_unlock ;;
 		install-umr) install_umr ;;
 		install-service) install_service ;;
 		write-service-table) write_service_table ;;

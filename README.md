@@ -27,6 +27,8 @@ The AMD BC-250 normally boots with a **factory driver topology of 24 CUs**. This
 
 Each **WGP contains 2 CUs**. The factory layout is therefore 12 WGPs, and full dispatch is 20 WGPs.
 
+The tool can also unlock the **2 factory-disabled CPU cores** (6c/12t -> 8c/16t) through the SMU. See [CPU core unlock](#cpu-core-unlock).
+
 > [!IMPORTANT]
 > Live changes are temporary unless you save the table and install the boot service. If you only apply a live table, the driver topology is restored after reboot.
 
@@ -116,6 +118,7 @@ The UI is designed so that write operations are reviewable. Pressing an action k
 | `w` | Write table | Save current table | Saves the current live table to `/etc/bc250-cu-live-manager.conf`. This prepares it for boot restore, but does not install the service by itself. |
 | `i` | Install service | Enable boot restore | Installs and enables the systemd service that reapplies the saved table on boot. It uses the table saved by `Write table`. |
 | `u` | Uninstall service | Remove boot restore | Disables and removes the boot service and saved config. |
+| `c` | Unlock CPU cores | CPU core unlock | Unlocks the 2 factory-disabled CPU cores through the SMU, then offers a reboot to bring them online. Skips the SMU write when the cores are already unlocked. |
 | `q` | Quit | Exit | Leaves the current live state as it is until reboot or until another action changes it. |
 
 > [!NOTE]
@@ -173,6 +176,47 @@ Open UI -> press e -> toggle WGPs -> Enter -> type accept -> confirm y -> press 
 
 This applies a custom table live, saves it, and enables automatic restore on boot.
 
+### Unlock the 2 disabled CPU cores
+
+```text
+Open UI -> press c -> type accept -> confirm y -> reboot y
+```
+
+This unlocks the CPU cores and reboots to bring them online. See [CPU core unlock](#cpu-core-unlock) for details.
+
+---
+
+## CPU core unlock
+
+The BC-250 APU physically has 8 Zen 2 CPU cores, but 2 are disabled by a core presence mask (`0x77` = 6c/12t). The mask is not host-writable, so the script asks the SMU to raise it to `0xFF` (8c/16t) using an ungated SMU mailbox message. Firmware then enumerates all 8 cores on the next boot.
+
+The workflow is simple and live, matching the rest of this tool:
+
+1. Press `c` in the menu (or run `cpu-unlock` from the CLI).
+2. The script first checks whether the cores are already enumerated (16 threads present) and does nothing if so.
+3. If the mask is stock `0x77`, it sends the SMU message and verifies the mask reads back `0xFF`.
+4. On success it asks whether to reboot now. The cores come online on the next reboot either way.
+
+The dashboard shows the current CPU state:
+
+```text
+CPU        : 12 threads present, 12 online; stock 6c/12t
+CPU        : 12 threads present, 12 online; unlock armed; reboot pending
+CPU        : 16 threads present, 16 online; unlocked 8c/16t
+```
+
+> [!IMPORTANT]
+> The unlock is volatile. A warm reboot preserves it, but a cold power cycle reverts the mask to stock. Re-run the unlock after full power loss. There is no boot service integration for this on purpose; it is a live, re-runnable action.
+
+> [!WARNING]
+> The 2 extra cores may have been disabled for a reason. Stress-test them before trusting the machine with real workloads. If the system is unstable with 8 cores, a full power cycle restores the stock 6-core configuration.
+
+Notes:
+
+- The SMU write requires the `cyan-skillfish-governor-smu` service to be stopped. The script stops it automatically for the write and restarts it afterward.
+- If the mask reads anything other than `0x77` or `0xFF`, the script aborts without writing.
+- `setpci` from `pciutils` is used for the SMU mailbox access.
+
 ---
 
 ## Temporary vs persistent changes
@@ -228,6 +272,7 @@ The `*` means the current live table is not saved as the boot table.
 - `umr`
 - `python3`
 - `libdrm_amdgpu.so.1`
+- `pciutils` (`setpci`) for the CPU core unlock
 - `systemd` for boot restore
 - Root privileges for register access
 
@@ -336,6 +381,15 @@ sudo ./bc250-cu-live-manager.sh enable-wgp 1.0.4
 sudo ./bc250-cu-live-manager.sh disable-wgp 1.0.4
 ```
 
+### CPU core unlock
+
+```bash
+# Unlock the 2 disabled CPU cores, then offer a reboot to bring them online
+sudo ./bc250-cu-live-manager.sh cpu-unlock
+```
+
+With `--yes` the unlock runs without prompts but never reboots automatically; reboot when ready.
+
 ### Boot restore commands
 
 ```bash
@@ -379,6 +433,8 @@ The tool reads and writes these BC-250 dispatch-related registers through UMR:
 - `mmSPI_PG_ENABLE_STATIC_WGP_MASK`
 - `mmRLC_PG_ALWAYS_ON_WGP_MASK`
 
+The CPU core unlock additionally uses `setpci` to talk to the SMU through the SMN index/data window (PCI config `0xB8`/`0xBC` on `0000:00:00.0`), raising the core presence mask at SMN `0x0115A870` from `0x77` to `0xFF`.
+
 Defaults:
 
 | Setting | Value |
@@ -413,6 +469,7 @@ routing state shown here is the active runtime state.
 - Type `accept` for the safety disclaimer, then confirm the dispatch plan with `y`.
 - Live disable paths are allowed, including driver-topology WGPs.
 - Boot persistence only happens after a table is saved and the service is installed.
+- The CPU core unlock verifies the mask before and after the SMU write, aborts on any unexpected value, and only reboots after an explicit `y`.
 
 ---
 
